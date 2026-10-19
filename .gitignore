@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Files uploaded through /api/upload
+public/uploads/
+
+# Local environment
+.env

@@ -532,3 +532,6 @@ export interface AppNotification {
   createdAt?: string;
   userId?: string;
 }
+
+// UI-only types (menus, feature tiles, onboarding)
+export * from './ui';

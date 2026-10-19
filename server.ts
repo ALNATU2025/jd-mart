@@ -5,6 +5,14 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import {
+  requireAuth,
+  rateLimit,
+  escapeHtml,
+  safeUrl,
+  isValidEmail,
+  validateUpload,
+} from './server/security';
 
 dotenv.config();
 
@@ -35,10 +43,32 @@ if (!fs.existsSync(uploadsDir)) {
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use('/uploads', express.static(uploadsDir));
+// The web app calls the API from the same origin, so cross-origin requests are
+// only allowed for origins listed in ALLOWED_ORIGINS (comma-separated).
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : false }));
+
+// 25MB file limit; base64 encoding adds about a third on top.
+app.use(express.json({ limit: '35mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use(
+  '/uploads',
+  express.static(uploadsDir, {
+    setHeaders: (res) => {
+      // Never let the browser guess a different (executable) content type.
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+    },
+  })
+);
+
+// Per-user limits for the routes that cost money or can be abused.
+const uploadLimit = rateLimit('upload', 30, 10 * 60 * 1000); // 30 files / 10 min
+const emailLimit = rateLimit('email', 30, 60 * 60 * 1000); // 30 emails / hour
+const chatLimit = rateLimit('chat', 120, 60 * 1000); // 120 messages / min
+const aiLimit = rateLimit('ai', 20, 10 * 60 * 1000); // 20 AI calls / 10 min
 
 // Health Check
 app.get('/api/health', (_req: Request, res: Response) => {
@@ -54,10 +84,10 @@ app.get('/api/health', (_req: Request, res: Response) => {
 });
 
 // Universal File Upload Endpoint (Images, PDFs, Word documents, etc.)
-app.post('/api/upload', async (req: Request, res: Response) => {
+app.post('/api/upload', requireAuth, uploadLimit, async (req: Request, res: Response) => {
   try {
-    const { fileName, fileType, base64Data, category, entityId } = req.body;
-    if (!base64Data || !fileName) {
+    const { fileName, fileType, base64Data, category, entityId } = req.body ?? {};
+    if (typeof base64Data !== 'string' || typeof fileName !== 'string' || !base64Data || !fileName) {
       return res.status(400).json({ error: 'fileName and base64Data are required.' });
     }
 
@@ -66,6 +96,11 @@ app.post('/api/upload', async (req: Request, res: Response) => {
       : base64Data;
 
     const buffer = Buffer.from(base64Clean, 'base64');
+    const uploadError = validateUpload(fileName, fileType, buffer.length);
+    if (uploadError) {
+      return res.status(400).json({ error: uploadError });
+    }
+
     const sanitizedName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
     const uniqueFileName = `${Date.now()}-${sanitizedName}`;
     const filePath = path.join(uploadsDir, uniqueFileName);
@@ -73,7 +108,7 @@ app.post('/api/upload', async (req: Request, res: Response) => {
     await fs.promises.writeFile(filePath, buffer);
 
     const publicUrl = `/uploads/${uniqueFileName}`;
-    console.log(`[FILE UPLOAD SUCCESS] Saved ${fileName} (${buffer.length} bytes) to ${publicUrl}`);
+    console.log(`[FILE UPLOAD] ${req.user?.uid} saved ${sanitizedName} (${buffer.length} bytes) to ${publicUrl}`);
 
     return res.json({
       success: true,
@@ -90,28 +125,43 @@ app.post('/api/upload', async (req: Request, res: Response) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Upload failed';
     console.error('File upload error:', msg);
-    return res.status(500).json({ error: 'Failed to process file upload: ' + msg });
+    return res.status(500).json({ error: 'Failed to process file upload.' });
   }
 });
 
 // Transactional Email Service Endpoint
-app.post('/api/email/send', async (req: Request, res: Response) => {
+app.post('/api/email/send', requireAuth, emailLimit, async (req: Request, res: Response) => {
   try {
-    const {
-      type,
-      to,
-      recipientName,
-      subject,
-      orderId,
-      amount,
-      trackingUrl,
-      role,
-      jobTitle,
-      details,
-    } = req.body;
+    const body = req.body ?? {};
+    const type = typeof body.type === 'string' ? body.type : 'general';
+    let to: string = typeof body.to === 'string' ? body.to.trim().toLowerCase() : '';
 
-    if (!to) {
-      return res.status(400).json({ error: 'Recipient email address (to) is required.' });
+    // Every value that ends up in the email is escaped so callers can't inject HTML.
+    const recipientName = body.recipientName ? escapeHtml(body.recipientName) : '';
+    const orderId = body.orderId ? escapeHtml(body.orderId) : '';
+    const amount = escapeHtml(Number(body.amount) || 0);
+    const role = body.role ? escapeHtml(body.role) : '';
+    const jobTitle = body.jobTitle ? escapeHtml(body.jobTitle) : '';
+    const details = body.details ? escapeHtml(String(body.details).slice(0, 1000)) : '';
+    const trackingUrl = safeUrl(body.trackingUrl);
+    // Subjects are plain text, but strip newlines and cap the length.
+    const plainText = (v: unknown, max = 150) => String(v ?? '').replace(/[\r\n]+/g, ' ').slice(0, max);
+    const subject = body.subject ? plainText(body.subject) : '';
+    const subjectName = plainText(body.recipientName, 60);
+    const subjectOrderId = plainText(body.orderId, 60);
+    const subjectJobTitle = plainText(body.jobTitle, 80);
+
+    // Account emails may only be sent to the signed-in user's own address.
+    if (['welcome', 'email_verification', 'password_reset'].includes(type) && to !== req.user?.email) {
+      return res.status(403).json({ error: 'This email can only be sent to your own address.' });
+    }
+    // Admin alerts always go to the configured admin inbox, never to a caller-chosen address.
+    if (type === 'admin_notification') {
+      to = (process.env.ADMIN_ALERT_EMAIL || '').trim().toLowerCase();
+    }
+
+    if (!isValidEmail(to)) {
+      return res.status(400).json({ error: 'A valid recipient email address (to) is required.' });
     }
 
     let renderedSubject = subject || 'JD Mart Notification';
@@ -119,7 +169,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
 
     switch (type) {
       case 'welcome':
-        renderedSubject = subject || `Welcome to JD Mart, ${recipientName || 'Member'}!`;
+        renderedSubject = subject || `Welcome to JD Mart, ${subjectName || 'Member'}!`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #1e40af;">Welcome to JD Mart Sierra Leone</h2>
@@ -139,7 +189,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
             <h2 style="color: #1e40af;">Verify Your Email Address</h2>
             <p>Hello ${recipientName || 'Member'},</p>
             <p>Please confirm your email address to unlock verified status and secure transactions on JD Mart.</p>
-            ${trackingUrl ? `<p><a href="${trackingUrl}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Verify Email</a></p>` : ''}
+            ${trackingUrl ? `<p><a href="${escapeHtml(trackingUrl)}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Verify Email</a></p>` : ''}
             <p style="font-size: 13px; color: #475569;">If you didn't create a JD Mart account, please disregard this email.</p>
             <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
             <p style="font-size: 12px; color: #64748b;">JD Mart Security Team</p>
@@ -154,7 +204,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
             <h2 style="color: #1e40af;">Password Reset Request</h2>
             <p>Hello ${recipientName || 'User'},</p>
             <p>We received a request to reset your password on JD Mart.</p>
-            ${trackingUrl ? `<p><a href="${trackingUrl}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Reset Password</a></p>` : ''}
+            ${trackingUrl ? `<p><a href="${escapeHtml(trackingUrl)}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Reset Password</a></p>` : ''}
             <p style="font-size: 13px; color: #64748b;">For security reasons, this reset link will expire soon. If you did not request this, you can safely ignore this message.</p>
             <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
             <p style="font-size: 12px; color: #64748b;">JD Mart Account Security</p>
@@ -163,14 +213,14 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
         break;
 
       case 'order_confirmation':
-        renderedSubject = subject || `Order Confirmed: #${orderId}`;
+        renderedSubject = subject || `Order Confirmed: #${subjectOrderId}`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #1e40af;">Thank you for your order!</h2>
             <p>Dear ${recipientName || 'Customer'},</p>
             <p>Your order <strong>#${orderId}</strong> has been received and confirmed.</p>
             <p><strong>Total Amount:</strong> Le ${amount || 0}</p>
-            ${trackingUrl ? `<p><a href="${trackingUrl}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Track Your Delivery</a></p>` : ''}
+            ${trackingUrl ? `<p><a href="${escapeHtml(trackingUrl)}" style="display:inline-block; padding:10px 20px; background:#1e40af; color:#fff; text-decoration:none; border-radius:8px;">Track Your Delivery</a></p>` : ''}
             <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
             <p style="font-size: 12px; color: #64748b;">JD Mart Logistics & Dispatch Network</p>
           </div>
@@ -178,7 +228,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
         break;
 
       case 'order_status':
-        renderedSubject = subject || `Order #${orderId} Status Update`;
+        renderedSubject = subject || `Order #${subjectOrderId} Status Update`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #1e40af;">Order Status Update</h2>
@@ -191,7 +241,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
         break;
 
       case 'seller_notification':
-        renderedSubject = subject || `New Order Received: #${orderId}`;
+        renderedSubject = subject || `New Order Received: #${subjectOrderId}`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #059669;">New Store Order Received!</h2>
@@ -206,13 +256,13 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
         break;
 
       case 'delivery_notification':
-        renderedSubject = subject || `Delivery Dispatch: Order #${orderId}`;
+        renderedSubject = subject || `Delivery Dispatch: Order #${subjectOrderId}`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #ea580c;">Delivery Assignment & Status</h2>
             <p>Hello ${recipientName || 'Courier/Customer'},</p>
             <p>Delivery update for order <strong>#${orderId}</strong>: <strong>${details || 'Dispatched'}</strong>.</p>
-            ${trackingUrl ? `<p><a href="${trackingUrl}" style="display:inline-block; padding:10px 20px; background:#ea580c; color:#fff; text-decoration:none; border-radius:8px;">View Delivery Details</a></p>` : ''}
+            ${trackingUrl ? `<p><a href="${escapeHtml(trackingUrl)}" style="display:inline-block; padding:10px 20px; background:#ea580c; color:#fff; text-decoration:none; border-radius:8px;">View Delivery Details</a></p>` : ''}
             <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
             <p style="font-size: 12px; color: #64748b;">JD Mart Express Courier Network</p>
           </div>
@@ -220,7 +270,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
         break;
 
       case 'job_application':
-        renderedSubject = subject || `Application Received: ${jobTitle || 'Role'}`;
+        renderedSubject = subject || `Application Received: ${subjectJobTitle || 'Role'}`;
         emailHtml = `
           <div style="font-family: Arial, sans-serif; padding: 24px; color: #1e293b;">
             <h2 style="color: #1e40af;">Job Application Notice</h2>
@@ -272,18 +322,23 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
             html: emailHtml,
           }),
         });
-        const resData = await response.json();
-        return res.json({ success: true, messageId: (resData as { id?: string }).id, provider: 'resend' });
+        const resData = (await response.json().catch(() => ({}))) as { id?: string; message?: string };
+        if (!response.ok) {
+          console.error('Resend rejected email:', response.status, resData.message);
+          return res.status(502).json({ error: 'Email provider rejected the message.' });
+        }
+        return res.json({ success: true, messageId: resData.id, provider: 'resend' });
       } catch (sendError) {
         console.warn('Third-party email dispatch failed, recording log:', sendError);
       }
     }
 
     // Production log audit for transactional email
-    console.log(`[EMAIL DISPATCH - ${type.toUpperCase()}] To: ${to} | Subject: "${renderedSubject}"`);
+    // No provider configured (or it failed): log only. Nothing was actually delivered.
+    console.log(`[EMAIL NOT SENT - ${type.toUpperCase()}] To: ${to} | Subject: "${renderedSubject}"`);
     return res.json({
       success: true,
-      delivered: true,
+      delivered: false,
       mode: 'transactional_queue',
       subject: renderedSubject,
       recipient: to,
@@ -296,7 +351,7 @@ app.post('/api/email/send', async (req: Request, res: Response) => {
 });
 
 // Real-Time Chat Notification Webhook Endpoint
-app.post('/api/chat/webhook', async (req: Request, res: Response) => {
+app.post('/api/chat/webhook', requireAuth, chatLimit, async (req: Request, res: Response) => {
   try {
     const {
       senderId,
@@ -306,14 +361,18 @@ app.post('/api/chat/webhook', async (req: Request, res: Response) => {
       text,
       conversationId,
       orderId,
-    } = req.body;
+    } = req.body ?? {};
+
+    if (senderId !== req.user?.uid) {
+      return res.status(403).json({ error: 'You can only send messages as yourself.' });
+    }
 
     const eventPayload = {
       event: 'chat.message.received',
       timestamp: new Date().toISOString(),
       sender: { id: senderId, name: senderName },
       recipient: { id: recipientId, name: recipientName },
-      preview: (text || '').slice(0, 100),
+      preview: String(text || '').slice(0, 100),
       conversationId,
       orderId: orderId || null,
     };
@@ -332,12 +391,12 @@ app.post('/api/chat/webhook', async (req: Request, res: Response) => {
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : 'Chat webhook failed';
     console.error('Chat Webhook Error:', msg);
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: 'Chat notification failed.' });
   }
 });
 
 // Gemini AI Server-Side API: Image Analysis & Product Details
-app.post('/api/ai/describe-image', async (req: Request, res: Response) => {
+app.post('/api/ai/describe-image', requireAuth, aiLimit, async (req: Request, res: Response) => {
   try {
     if (!ai) {
       return res.status(503).json({
@@ -345,9 +404,16 @@ app.post('/api/ai/describe-image', async (req: Request, res: Response) => {
       });
     }
 
-    const { imageUrl, base64Data, mimeType } = req.body;
+    const { base64Data, mimeType } = req.body ?? {};
+    const imageUrl = safeUrl(req.body?.imageUrl);
     if (!imageUrl && !base64Data) {
       return res.status(400).json({ error: 'Please provide either imageUrl or base64Data for image analysis.' });
+    }
+    if (base64Data && (typeof base64Data !== 'string' || base64Data.length > 14 * 1024 * 1024)) {
+      return res.status(400).json({ error: 'Image must be under 10MB.' });
+    }
+    if (mimeType && !/^image\/(jpeg|png|webp|gif|heic|heif)$/.test(mimeType)) {
+      return res.status(400).json({ error: 'Unsupported image type.' });
     }
 
     let contentsParts: unknown[] = [];
@@ -398,7 +464,7 @@ app.post('/api/ai/describe-image', async (req: Request, res: Response) => {
 });
 
 // Gemini AI Server-Side API: Generate Description
-app.post('/api/ai/generate-description', async (req: Request, res: Response) => {
+app.post('/api/ai/generate-description', requireAuth, aiLimit, async (req: Request, res: Response) => {
   try {
     if (!ai) {
       return res.status(503).json({
@@ -406,7 +472,9 @@ app.post('/api/ai/generate-description', async (req: Request, res: Response) => 
       });
     }
 
-    const { title, category, keywords } = req.body;
+    const title = typeof req.body?.title === 'string' ? req.body.title.slice(0, 200) : '';
+    const category = typeof req.body?.category === 'string' ? req.body.category.slice(0, 100) : '';
+    const keywords = typeof req.body?.keywords === 'string' ? req.body.keywords.slice(0, 500) : '';
     if (!title) {
       return res.status(400).json({ error: 'Title is required to generate description.' });
     }
@@ -452,7 +520,11 @@ async function setupServer() {
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req: Request, res: Response) => {
+    // SPA fallback. Express 5 no longer accepts app.get('*'), so use a final middleware.
+    app.use((req: Request, res: Response) => {
+      if (req.method !== 'GET' || req.path.startsWith('/api/')) {
+        return res.status(404).json({ error: 'Not found' });
+      }
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }

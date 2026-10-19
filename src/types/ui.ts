@@ -1,18 +1,7 @@
-export * from './types/index';
-
-import { UserRole } from './types/index';
+// UI-only types used by static menus, feature tiles and onboarding slides.
+import type { UserRole } from './index';
 
 export type PlatformRole = UserRole;
-
-export type ScreenName =
-  | 'splash'
-  | 'onboarding'
-  | 'login'
-  | 'signup'
-  | 'forgot-password'
-  | 'home'
-  | 'product-detail'
-  | string;
 
 export interface MenuItemModel {
   id: string;

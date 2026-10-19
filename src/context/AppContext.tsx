@@ -85,6 +85,7 @@ import {
   FirebaseUser,
 } from '../lib/firebase';
 import { uploadAppFile, StorageCategory, UploadedFileMetadata } from '../lib/storage';
+import { apiFetch } from '../lib/api';
 
 interface AppContextType {
   currentPath: string;
@@ -1268,7 +1269,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       localStorage.setItem('jdmart_current_user', JSON.stringify(newUser));
 
       // Trigger Welcome Email
-      fetch('/api/email/send', {
+      apiFetch('/api/email/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1361,7 +1362,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
 
         // Trigger Welcome Email
-        fetch('/api/email/send', {
+        apiFetch('/api/email/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1393,7 +1394,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       await sendEmailVerification(auth.currentUser);
       showToast(`Verification link sent to ${auth.currentUser.email}`);
       // Server-side notification backup
-      fetch('/api/email/send', {
+      apiFetch('/api/email/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1761,7 +1762,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       await setDoc(doc(db, 'messages', id), newMsg);
 
       // Trigger Webhook on server
-      fetch('/api/chat/webhook', {
+      apiFetch('/api/chat/webhook', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2257,7 +2258,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     // Trigger Order Confirmation Email to Buyer
-    fetch('/api/email/send', {
+    apiFetch('/api/email/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2271,7 +2272,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }).catch((e) => console.warn('Order email notification error:', e));
 
     // Trigger Seller Notification Email
-    fetch('/api/email/send', {
+    apiFetch('/api/email/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2363,7 +2364,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     // Send email alert for order status
-    fetch('/api/email/send', {
+    apiFetch('/api/email/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3164,7 +3165,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       console.warn('Firestore job application sync error:', e);
     }
 
-    fetch('/api/email/send', {
+    apiFetch('/api/email/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3318,7 +3319,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const generateAIDescription = async (title: string, category?: string): Promise<string> => {
     try {
-      const res = await fetch('/api/ai/generate-description', {
+      const res = await apiFetch('/api/ai/generate-description', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, category }),
@@ -3335,7 +3336,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const analyzeImageWithAI = async (imageUrl?: string, base64?: string): Promise<any> => {
     try {
-      const res = await fetch('/api/ai/describe-image', {
+      const res = await apiFetch('/api/ai/describe-image', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageUrl, base64Data: base64 }),

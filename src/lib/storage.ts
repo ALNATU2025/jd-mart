@@ -1,4 +1,5 @@
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject, storage } from './firebase';
+import { apiFetch } from './api';
 
 export interface FileValidationOptions {
   maxSizeMB?: number;
@@ -111,7 +112,7 @@ export async function uploadAppFile(
 
   // 2. Primary Upload Path: Server-side persistent storage /api/upload
   try {
-    const response = await fetch('/api/upload', {
+    const response = await apiFetch('/api/upload', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
